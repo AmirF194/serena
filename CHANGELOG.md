@@ -10,6 +10,12 @@ Status of the `main` branch. Changes prior to the next official version change w
     the `line_ending` setting is meant to be the single point of line-ending translation on write. The
     fallback now normalizes line endings to LF, consistently with the primary path.
 
+* Tools:
+  - Fix: a tool call that exceeded `tool_timeout` returned the bare, uninformative message
+    `"TimeoutError: "` to the client (since `str(TimeoutError())` is empty). `Tool.apply_ex` now
+    reports which tool timed out and after how many seconds, and notes that the call may still be
+    running in the background.
+
 * JetBrains:
   - Allow external files from dependencies (specified via references like "<ext:FileUtil.class|472e0a13>") to be
     - read via `ReadFileTool` 

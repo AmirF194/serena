@@ -426,7 +426,15 @@ class Tool(Component):
         except ToolCallError as e:
             tool_call_error = e
         except Exception as e:  # typically TimeoutError (other exceptions caught and forwarded as ToolCallError in the task)
-            msg = f"{e.__class__.__name__}: {e}"
+            if isinstance(e, TimeoutError):
+                # concurrent.futures.TimeoutError (an alias of the builtin since Python 3.11) carries no message,
+                # so f"{e.__class__.__name__}: {e}" would render as the uninformative "TimeoutError: "
+                msg = (
+                    f"Tool '{self.get_name_from_cls()}' timed out after {self.agent.serena_config.tool_timeout} seconds "
+                    "(the tool call may still be running in the background)"
+                )
+            else:
+                msg = f"{e.__class__.__name__}: {e}"
             log.error(msg)
             tool_call_error = ToolCallError(msg)
         if catch_exceptions:
