@@ -16,6 +16,10 @@ Status of the `main` branch. Changes prior to the next official version change w
     rather than guessing at a body that could be wrong #1498
 
 * Language Servers:
+  - Rust (rust-analyzer): retry requests that rust-analyzer cancels with `ContentModified` (-32801)
+    due to a concurrent salsa mutation (e.g. background re-indexing after a file is opened), instead
+    of surfacing a hard `SolidLSPException`. `hover` is outside rust-analyzer's own internal-retry
+    set, so a transient cancellation previously failed the calling tool. #1724
   - Fix: Properly differentiate between raw and high-level symbol cache fingerprints, avoiding unnecessary
     invalidations of the raw cache when only the derived high-level representation changes
   - Fix: Language servers were not notified of external file system changes, causing some

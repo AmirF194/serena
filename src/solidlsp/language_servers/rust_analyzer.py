@@ -9,14 +9,24 @@ import platform
 import shutil
 import subprocess
 import threading
+import time
 
 from overrides import override
 
 from solidlsp.ls import LanguageServerDependencyProvider, LanguageServerDependencyProviderSinglePath, SolidLanguageServer
 from solidlsp.ls_config import LanguageServerConfig
+from solidlsp.ls_exceptions import SolidLSPException
+from solidlsp.lsp_protocol_handler.lsp_types import LSPErrorCodes
+from solidlsp.lsp_protocol_handler.server import LSPError, PayloadLike
 from solidlsp.settings import SolidLSPSettings
 
 log = logging.getLogger(__name__)
+
+# rust-analyzer turns a salsa computation cancelled by a concurrent workspace mutation into a
+# `content modified` error response (content_modified_error() in
+# crates/rust-analyzer/src/handlers/dispatch.rs) unless the method is in its hard-coded
+# internal-retry set, which does not include hover. Recovery is therefore the client's job.
+_CONTENT_MODIFIED_RETRY_ERROR_CODES = (LSPErrorCodes.ContentModified,)
 
 
 class RustAnalyzer(SolidLanguageServer):
@@ -207,6 +217,39 @@ class RustAnalyzer(SolidLanguageServer):
     @override
     def is_ignored_dirname(self, dirname: str) -> bool:
         return super().is_ignored_dirname(dirname) or dirname in ["target"]
+
+    def _install_content_modified_retry(self, max_retries: int = 5, retry_delay: float = 0.2) -> None:
+        """
+        Wraps the underlying ``send_request`` so that requests rust-analyzer cancels with
+        ``ContentModified`` (-32801) due to a concurrent salsa mutation (e.g. background
+        re-indexing after a file is opened) are transparently retried instead of surfacing as a
+        hard ``SolidLSPException``. Mirrors ``PyreflyLanguageServer._install_mutation_retry``,
+        scoped to ``ContentModified`` only: ``RequestCancelled`` (-32800) is client-initiated
+        per the LSP spec and not a transient server condition to retry. See #1724.
+        """
+        inner_send_request = self.server.send_request
+
+        def send_request_with_retry(method: str, params: dict | None = None) -> PayloadLike:
+            last_exc: SolidLSPException | None = None
+            for attempt in range(1, max_retries + 1):
+                try:
+                    return inner_send_request(method, params)
+                except SolidLSPException as e:
+                    cause = e.cause
+                    if not (isinstance(cause, LSPError) and int(cause.code) in _CONTENT_MODIFIED_RETRY_ERROR_CODES):
+                        raise
+                    last_exc = e
+                    log.info(
+                        "rust-analyzer request %s canceled with ContentModified (concurrent mutation); retrying (%d/%d)",
+                        method,
+                        attempt,
+                        max_retries,
+                    )
+                    time.sleep(retry_delay)
+            assert last_exc is not None
+            raise last_exc
+
+        self.server.send_request = send_request_with_retry  # type: ignore[method-assign]
 
     def _create_base_initialize_params(self) -> dict:
         """
@@ -713,6 +756,8 @@ class RustAnalyzer(SolidLanguageServer):
 
         log.info("Starting RustAnalyzer server process")
         self.server.start()
+        # retry requests rust-analyzer cancels with ContentModified during a concurrent salsa mutation
+        self._install_content_modified_retry()
         initialize_params = self._create_initialize_params()
 
         log.info("Sending initialize request from LSP client to LSP server and awaiting response")
