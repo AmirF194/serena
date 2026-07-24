@@ -513,13 +513,7 @@ class StdioLanguageServer(LanguageServerInterface):
     def _start(self) -> None:
         log.info("Starting language server process via command: %s", self.process_launch_info.cmd)
 
-        # An independent session (its own process group, detached from ours) is what lets a
-        # SIGKILLed Serena leave the language server behind as an orphan: our own graceful
-        # shutdown code (subprocess_util.terminate_process_tree_with_kill_fallback) never runs in
-        # that case, and being in its own session means no signal to our process group reaches it
-        # either. LanguageServerSubprocessLauncher closes that gap on Linux at spawn time via
-        # PR_SET_PDEATHSIG when start_new_session is set.
-        process = subprocess_util.LanguageServerSubprocessLauncher.instance().launch(
+        process = subprocess_util.LanguageServerSubprocessLauncher.get_instance().launch(
             self.process_launch_info, start_new_session=self.start_independent_lsp_process
         )
         self.process = process

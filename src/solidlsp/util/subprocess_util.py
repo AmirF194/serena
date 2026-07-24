@@ -12,85 +12,11 @@ import oslex
 import psutil
 
 if TYPE_CHECKING:
+    import ctypes
+
     from solidlsp.lsp_protocol_handler.server import ProcessLaunchInfo
 
 log = logging.getLogger(__name__)
-
-# Resolved once at import time rather than inside the preexec_fn below: preexec_fn runs in the
-# forked child before exec(), where only async-signal-safe operations are safe to perform, and an
-# import/ctypes.CDLL lookup at that point is not.
-_libc = None
-if platform.system() == "Linux":
-    import ctypes
-
-    _libc = ctypes.CDLL("libc.so.6", use_errno=True)
-_PR_SET_PDEATHSIG = 1
-
-
-def set_pdeathsig_on_parent_exit() -> None:
-    """
-    preexec_fn for subprocess.Popen (Linux only, no-op elsewhere): asks the kernel to send this
-    process SIGTERM if its parent dies for any reason, including SIGKILL, via
-    prctl(PR_SET_PDEATHSIG). This is the only mechanism that can free the child when the parent
-    is killed rather than exiting gracefully, since a graceful exit is required to run any
-    signal-the-tree cleanup code ourselves.
-
-    Only protects the immediate process this is passed to. When launching with shell=True, that
-    process is the shell, not the program it runs, so the registration alone will not protect a
-    program the shell forks as a child; see LanguageServerSubprocessLauncher's `exec` prefix, which
-    makes the shell replace itself with the program instead of forking it, so the same PID (and
-    therefore the same PDEATHSIG registration, which execve preserves) carries through.
-
-    Warning this function's caller (LanguageServerSubprocessLauncher below) exists to guard
-    against: per `man 2 prctl`, PR_SET_PDEATHSIG's "parent" is specifically the OS THREAD that
-    called fork() to create this process, not the parent process as a whole -- if that thread
-    terminates while the rest of the parent process (e.g. its main thread) keeps running, the death
-    signal fires anyway.
-    """
-    if _libc is not None:
-        _libc.prctl(_PR_SET_PDEATHSIG, signal.SIGTERM)
-
-
-class _PDeathSigSpawner:
-    """
-    Runs subprocess.Popen() calls that register PR_SET_PDEATHSIG on one dedicated, permanently
-    running daemon thread, so the "parent thread" the kernel ties the registration to is never a
-    short-lived one.
-
-    Why this exists: LanguageServerSubprocessLauncher.launch() (the sole caller of this class) is
-    very often invoked from a thread that is *intentionally* short-lived. For example,
-    LanguageServerManager.from_languages spawns one StartLSThread per language server; each one
-    calls language_server.start() (-> ._start(), where Popen() happens) and then simply returns,
-    terminating moments after Popen() itself returns. Because PR_SET_PDEATHSIG's delivery is tied
-    to that specific calling thread (see the warning on set_pdeathsig_on_parent_exit above), the
-    language server would then receive the parent-death signal and exit almost immediately, even
-    though Serena's process is still fully alive -- the exact CI-only regression this class fixes.
-    Funneling the fork()/exec() itself through one thread that never voluntarily exits (it only
-    ever terminates alongside the whole process, which is exactly the case PR_SET_PDEATHSIG is
-    meant to detect) decouples "which caller thread happened to invoke _start()" from "does the
-    language server survive."
-    """
-
-    def __init__(self) -> None:
-        self._queue: queue.Queue[tuple[Callable[[], subprocess.Popen], "queue.Queue"]] = queue.Queue()
-        self._thread = threading.Thread(target=self._run, name="solidlsp-pdeathsig-spawner", daemon=True)
-        self._thread.start()
-
-    def _run(self) -> None:
-        while True:
-            func, result_queue = self._queue.get()
-            try:
-                result_queue.put((None, func()))
-            except BaseException as e:
-                result_queue.put((e, None))
-
-    def spawn(self, func: Callable[[], subprocess.Popen]) -> subprocess.Popen:
-        result_queue: queue.Queue = queue.Queue(maxsize=1)
-        self._queue.put((func, result_queue))
-        error, process = result_queue.get()
-        if error is not None:
-            raise error
-        return process
 
 
 def subprocess_kwargs() -> dict:
@@ -146,39 +72,63 @@ def convert_shell_cmd(cmd: str | list[str]) -> str:
 
 class LanguageServerSubprocessLauncher:
     """
-    Singleton that launches a language server subprocess whose lifecycle is tied to this process
-    (on Linux, when requested via ``start_new_session``). This reifies, as one unit, several
-    pieces that only work correctly when combined and would otherwise have to be assembled by hand
-    at every call site: the `exec` prefixing of the shell command, the libc/prctl preexec_fn that
-    registers PR_SET_PDEATHSIG, the platform/own-session gate that decides whether any of this
-    applies, and the dedicated long-lived spawner thread that the PR_SET_PDEATHSIG registration
-    requires (see _PDeathSigSpawner: its "parent" is the calling OS *thread*, not the process, so a
-    short-lived calling thread would defeat it).
+    Launcher for language server subprocesses, which are started for stdio-based communication.
+    It is home to the concern of launching a subprocess with well-defined lifecycle properties,
+    ensuring, in particular, that a launched subprocess cannot outlive this process (insofar as
+    the platform allows) -- even if the subprocess is started in its own session (see
+    :meth:`launch`) and this process is terminated forcefully without the opportunity to perform
+    cleanup (e.g. SIGKILL).
 
-    The class is a singleton because the spawner thread it owns must be a single, permanently
-    running thread for the entire process: PR_SET_PDEATHSIG's registration is tied to whichever OS
-    thread performs the fork(), so there can only be one such thread doing pdeathsig-registering
-    spawns if the registration is to reliably outlive the caller. ``launch()`` takes
-    ``start_new_session`` per call and the instance otherwise carries no per-call configuration, so
-    sharing one instance across all callers is safe.
+    The class is a singleton, as it is (potentially) home to a persistent worker thread.
     """
+
+    _PR_SET_PDEATHSIG = 1
+    """the PR_SET_PDEATHSIG option value for prctl(2)"""
 
     _instance: "LanguageServerSubprocessLauncher | None" = None
     _instance_lock = threading.Lock()
 
     def __init__(self) -> None:
-        # Created lazily (see _spawn_with_pdeathsig): the dedicated spawner thread is only needed
-        # for own-session launches on Linux, which not every caller requests.
-        self._spawner: _PDeathSigSpawner | None = None
+        self._libc = self._load_libc()
+        self._spawner: "LanguageServerSubprocessLauncher._PDeathSigSpawner | None" = None
         self._spawner_lock = threading.Lock()
 
     @classmethod
-    def instance(cls) -> "LanguageServerSubprocessLauncher":
+    def get_instance(cls) -> "LanguageServerSubprocessLauncher":
         if cls._instance is None:
             with cls._instance_lock:
                 if cls._instance is None:
                     cls._instance = cls()
         return cls._instance
+
+    @staticmethod
+    def _load_libc() -> "ctypes.CDLL | None":
+        """
+        Loads libc if on Linux, where it is needed for pdeathsig protection.
+        """
+        if platform.system() != "Linux":
+            return None
+        import ctypes
+
+        try:
+            # resolve libc, passing None to resolve symbols from the current process image (which is linked against libc on any Linux)
+            return ctypes.CDLL(None)
+        except OSError as e:
+            log.warning(
+                "Could not load libc (%s); language server processes will not be protected against "
+                "orphaning if this process is killed without a chance to shut down cleanly",
+                e,
+            )
+            return None
+
+    def _set_pdeathsig_on_parent_exit(self) -> None:
+        """
+        preexec_fn for subprocess.Popen (no-op if libc is unavailable), which asks the kernel, via
+        prctl(PR_SET_PDEATHSIG), to send this process SIGTERM when its parent dies for any reason,
+        including SIGKILL.
+        """
+        if self._libc is not None:
+            self._libc.prctl(self._PR_SET_PDEATHSIG, signal.SIGTERM)
 
     def launch(self, process_launch_info: "ProcessLaunchInfo", start_new_session: bool) -> subprocess.Popen[bytes]:
         """
@@ -186,35 +136,29 @@ class LanguageServerSubprocessLauncher:
 
         :param process_launch_info: the command, environment and working directory to launch with
         :param start_new_session: whether to start the process in its own session (own process
-            group, detached from ours). This is what leaves an orphan behind if we are SIGKILLed
-            without a chance to clean up, so on Linux, requesting it also arms
-            prctl(PR_SET_PDEATHSIG) on the actual language server process (not the intermediate
-            shell -- see the `exec` prefix below), ensuring the kernel sends it SIGTERM if this
-            process dies for any reason. On other platforms, this parameter only controls the
-            process-group behavior; there is no equivalent kernel-level protection available.
-        :return: the started process, with binary (bytes) stdio pipes
+            group, detached from ours)
         """
+        # build the child environment from ours, overridden by the launch info's entries
         child_proc_env = os.environ.copy()
         child_proc_env.update(process_launch_info.env)
 
-        use_pdeathsig = start_new_session and platform.system() == "Linux"
+        # convert the command for shell=True execution, prefixing `exec` when pdeathsig applies
+        use_pdeathsig = start_new_session and self._libc is not None
         cmd = convert_shell_cmd(process_launch_info.cmd)
         if use_pdeathsig:
-            # Makes the shell replace its own process image with the program (execve) instead of
-            # forking it as a child, so the PID -- and therefore the PR_SET_PDEATHSIG registration
-            # below, which execve preserves -- carries through to the actual language server
-            # process rather than protecting only the intermediate shell.
+            # `exec` makes the shell replace its own process image with the program (execve)
+            # instead of forking it as a child, so the PID -- and therefore the PR_SET_PDEATHSIG
+            # registration below, which execve preserves -- carries through to the actual language
+            # server process rather than protecting only the intermediate shell
             cmd = f"exec {cmd}"
 
+        # assemble platform kwargs and lifecycle settings
         kwargs: dict[str, Any] = subprocess_kwargs()
         kwargs["start_new_session"] = start_new_session
         if use_pdeathsig:
-            kwargs["preexec_fn"] = set_pdeathsig_on_parent_exit
+            kwargs["preexec_fn"] = self._set_pdeathsig_on_parent_exit
 
         def do_popen() -> subprocess.Popen[bytes]:
-            # the language server is launched with binary (bytes) pipes; the cast is needed because
-            # the presence of platform-specific **kwargs prevents ty from selecting the bytes Popen
-            # overload
             return cast(
                 "subprocess.Popen[bytes]",
                 subprocess.Popen(
@@ -229,20 +173,44 @@ class LanguageServerSubprocessLauncher:
                 ),
             )
 
-        # Funneling the fork() itself through the dedicated spawner thread (rather than calling
-        # Popen() on the calling thread directly) matters specifically when use_pdeathsig is set:
-        # the actual fork() has to happen on a thread that outlives the calling thread, which may
-        # itself be short-lived (e.g. LanguageServerManager's per-server StartLSThread) -- see
-        # _PDeathSigSpawner's docstring for why a plain Popen() call here would defeat the fix for
-        # #1490 in exactly that case. When pdeathsig isn't needed, calling Popen() directly is
-        # exactly equivalent and avoids spinning up the spawner thread for no reason.
+        # perform the actual Popen call, funneling the fork() through the dedicated spawner thread
+        # when pdeathsig applies
         if not use_pdeathsig:
             return do_popen()
-        with self._spawner_lock:
-            if self._spawner is None:
-                self._spawner = _PDeathSigSpawner()
-            spawner = self._spawner
-        return spawner.spawn(do_popen)
+        else:
+            with self._spawner_lock:
+                if self._spawner is None:
+                    self._spawner = self._PDeathSigSpawner()
+                spawner = self._spawner
+            return spawner.spawn(do_popen)
+
+    class _PDeathSigSpawner:
+        """
+        Runs subprocess.Popen() calls that register PR_SET_PDEATHSIG on one dedicated, permanently
+        running daemon thread, so the "parent thread" the kernel ties the registration to is one
+        that has the same lifetime as the process
+        """
+
+        def __init__(self) -> None:
+            self._queue: queue.Queue[tuple[Callable[[], subprocess.Popen], "queue.Queue"]] = queue.Queue()
+            self._thread = threading.Thread(target=self._run, name="solidlsp-pdeathsig-spawner", daemon=True)
+            self._thread.start()
+
+        def _run(self) -> None:
+            while True:
+                func, result_queue = self._queue.get()
+                try:
+                    result_queue.put((None, func()))
+                except BaseException as e:
+                    result_queue.put((e, None))
+
+        def spawn(self, func: Callable[[], subprocess.Popen]) -> subprocess.Popen:
+            result_queue: queue.Queue = queue.Queue(maxsize=1)
+            self._queue.put((func, result_queue))
+            error, process = result_queue.get()
+            if error is not None:
+                raise error
+            return process
 
 
 def _signal_process_tree(process: subprocess.Popen[bytes], terminate: bool = True) -> None:
