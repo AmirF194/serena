@@ -1,8 +1,6 @@
 import asyncio
 import json
 import logging
-import os
-import platform
 import socket
 import subprocess
 import threading
@@ -11,7 +9,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from queue import Empty, Queue
-from typing import IO, Any, AnyStr, cast
+from typing import IO, Any, AnyStr
 
 from sensai.util.string import ToStringMixin
 
@@ -513,42 +511,16 @@ class StdioLanguageServer(LanguageServerInterface):
         return self.process is not None and self.process.returncode is None
 
     def _start(self) -> None:
-        child_proc_env = os.environ.copy()
-        child_proc_env.update(self.process_launch_info.env)
+        log.info("Starting language server process via command: %s", self.process_launch_info.cmd)
 
         # An independent session (its own process group, detached from ours) is what lets a
         # SIGKILLed Serena leave the language server behind as an orphan: our own graceful
         # shutdown code (subprocess_util.terminate_process_tree_with_kill_fallback) never runs in
         # that case, and being in its own session means no signal to our process group reaches it
-        # either. On Linux, close that gap at spawn time via PR_SET_PDEATHSIG, which needs the
-        # actual language server process (not the intermediate shell that runs it) to be the one
-        # holding the registration; see convert_shell_cmd's `exec` prefix.
-        use_pdeathsig = self.start_independent_lsp_process and platform.system() == "Linux"
-        cmd = subprocess_util.convert_shell_cmd(self.process_launch_info.cmd, use_exec=use_pdeathsig)
-        log.info("Starting language server process via command: %s", self.process_launch_info.cmd)
-        kwargs = subprocess_util.subprocess_kwargs()
-        kwargs["start_new_session"] = self.start_independent_lsp_process
-        if use_pdeathsig:
-            kwargs["preexec_fn"] = subprocess_util.set_pdeathsig_on_parent_exit
-        # the language server is launched with binary (bytes) pipes; the cast is needed because the
-        # presence of platform-specific **kwargs prevents ty from selecting the bytes Popen overload
-        # popen_preserving_pdeathsig (rather than a plain subprocess.Popen call) matters specifically
-        # when use_pdeathsig is set: the actual fork() has to happen on a thread that outlives the
-        # calling thread, which may itself be short-lived (e.g. LanguageServerManager's per-server
-        # StartLSThread) -- see its docstring for why a plain Popen call here would defeat the fix
-        # for #1490 in exactly that case.
-        process = cast(
-            "subprocess.Popen[bytes]",
-            subprocess_util.popen_preserving_pdeathsig(
-                cmd,
-                stdout=subprocess.PIPE,
-                stdin=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=child_proc_env,
-                cwd=self.process_launch_info.cwd,
-                shell=True,
-                **kwargs,
-            ),
+        # either. LanguageServerSubprocessLauncher closes that gap on Linux at spawn time via
+        # PR_SET_PDEATHSIG when start_new_session is set.
+        process = subprocess_util.LanguageServerSubprocessLauncher.instance().launch(
+            self.process_launch_info, start_new_session=self.start_independent_lsp_process
         )
         self.process = process
 

@@ -15,6 +15,7 @@ other platforms.
 
 from __future__ import annotations
 
+import inspect
 import platform
 import subprocess
 import sys
@@ -24,6 +25,9 @@ import uuid
 
 import psutil
 import pytest
+
+from solidlsp.lsp_protocol_handler.server import ProcessLaunchInfo
+from solidlsp.util.subprocess_util import LanguageServerSubprocessLauncher, convert_shell_cmd
 
 pytestmark = pytest.mark.skipif(platform.system() != "Linux", reason="PR_SET_PDEATHSIG is Linux-specific")
 
@@ -132,6 +136,44 @@ def test_language_server_process_survives_a_short_lived_calling_thread() -> None
             proc.kill()
         if driver.poll() is None:
             driver.kill()
+
+
+def test_convert_shell_cmd_has_no_lifecycle_concern() -> None:
+    """
+    convert_shell_cmd is a pure command-formatting utility; its other callers (e.g.
+    solidlsp.language_servers.common, serena.agent) have no use for the `exec` prefixing that
+    PR_SET_PDEATHSIG needs, and prefixing with `exec` is invalid on Windows. That concern now
+    lives entirely inside LanguageServerSubprocessLauncher, applied to this function's output, so
+    it can never be requested without the preexec_fn/dedicated-thread machinery it depends on.
+    """
+    assert "use_exec" not in inspect.signature(convert_shell_cmd).parameters
+    assert convert_shell_cmd(["python3", "-c", "pass"]) == "python3 -c pass"
+
+
+def test_language_server_subprocess_launcher_is_a_singleton() -> None:
+    assert LanguageServerSubprocessLauncher.instance() is LanguageServerSubprocessLauncher.instance()
+
+
+def test_language_server_subprocess_launcher_spawner_thread_is_lazy() -> None:
+    """
+    The dedicated spawner thread is only needed for own-session launches on Linux; a fresh
+    launcher instance that has only ever performed a non-own-session launch should not have
+    created it.
+    """
+    launcher = LanguageServerSubprocessLauncher()
+    assert launcher._spawner is None
+
+    process = launcher.launch(
+        ProcessLaunchInfo(cmd=[sys.executable, "-c", "print('hi')"], cwd="/tmp"),
+        start_new_session=False,
+    )
+    try:
+        process.wait(timeout=5)
+    finally:
+        if process.poll() is None:
+            process.kill()
+
+    assert launcher._spawner is None
 
 
 def test_language_server_process_dies_with_a_sigkilled_serena() -> None:
