@@ -35,6 +35,11 @@ Status of the `main` branch. Changes prior to the next official version change w
   - Fix: F#'s `module <Name>` declarations reported a `selectionRange` pointing at the `module`
     keyword instead of at `<Name>`, so looking up hover/references from a module symbol's position
     returned the keyword's own docs instead of the module's #925
+  - Fix: a file already open in a language server session that was modified on disk by something
+    other than Serena's own edit tools (an external editor, `git checkout`, a build step) kept
+    serving symbols, definitions and other query results from the content last sent at `didOpen`
+    or the last Serena-made edit, because no `didChange` notification was sent for the external
+    change. Reading the file's content now sends one when it detects this #1593
 
 * JetBrains:
   - `jet_brains_find_symbol`: Disallow wildcard-only search, delegating to overview tool if request is for file

@@ -1,3 +1,6 @@
+import time
+from pathlib import Path
+
 import pytest
 
 from serena.project import Project
@@ -65,6 +68,44 @@ class TestLanguageServerBasics:
 
         for func_name in expected_functions:
             assert func_name in symbol_names, f"Should find {func_name} function in symbols"
+
+    @pytest.mark.parametrize("language_server", [LanguageServerId.CLOJURE], indirect=True)
+    def test_document_symbols_reflect_external_edit(self, language_server: SolidLanguageServer):
+        """
+        Regression test for #1593: a file already open in the LS session that gets modified
+        on disk by something other than insert_text_at_position/delete_text_between_positions
+        (an external editor, a checkout, a build step, ...) must not keep serving symbols
+        computed from the language server's last known (now stale) buffer state.
+        """
+        with language_server.open_file(CORE_PATH):
+            symbols_before = [s["name"] for s in language_server.request_document_symbols(CORE_PATH).get_all_symbols_and_roots()[0]]
+            assert "probe-new-fn" not in symbols_before
+
+            abs_path = Path(language_server.language_server.repository_root_path) / CORE_PATH
+            original_contents = abs_path.read_text()
+            abs_path.write_text(original_contents + "\n\n(defn probe-new-fn [] :probe-marker)\n")
+            try:
+                # Poll rather than issue a single query: sending the didChange that keeps the
+                # language server's own view in sync is a side effect of noticing the on-disk
+                # change (see LSPFileBuffer.contents), and clojure-lsp reanalyzes asynchronously,
+                # so the first query or two after the edit may still legitimately be in flight.
+                # Each retry clears serena's own document-symbols cache so it re-queries the
+                # language server instead of replaying whatever the previous retry cached.
+                deadline = time.monotonic() + 10.0
+                symbols_after = symbols_before
+                while "probe-new-fn" not in symbols_after and time.monotonic() < deadline:
+                    language_server._document_symbols_cache.pop(CORE_PATH, None)
+                    language_server._raw_document_symbols_cache.pop(CORE_PATH, None)
+                    symbols_after = [s["name"] for s in language_server.request_document_symbols(CORE_PATH).get_all_symbols_and_roots()[0]]
+                    if "probe-new-fn" not in symbols_after:
+                        time.sleep(0.3)
+            finally:
+                abs_path.write_text(original_contents)
+
+            assert "probe-new-fn" in symbols_after, (
+                "document symbols should reflect an on-disk edit made outside serena's own edit calls "
+                f"for a file already open in the session, got: {symbols_after}"
+            )
 
     @pytest.mark.parametrize("language_server", [LanguageServerId.CLOJURE], indirect=True)
     def test_hover(self, language_server: SolidLanguageServer):

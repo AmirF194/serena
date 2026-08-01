@@ -154,17 +154,36 @@ class LSPFileBuffer:
         file_modified_date = self.abs_path.stat().st_mtime
 
         # if contents are cached, check if they are stale (file modification since last read) and invalidate if so
+        externally_modified = False
         if self._contents is not None:
             assert self._read_file_modified_date is not None
             if file_modified_date > self._read_file_modified_date:
                 self._contents = None
+                externally_modified = True
 
         if self._contents is None:
             self._read_file_modified_date = file_modified_date
             self._contents = FileUtils.read_file(str(self.abs_path), self.encoding)
             self._content_hash = None
+            # a change from outside insert_text_at_position/delete_text_between_positions: the LS
+            # buffer is now stale, so bring it up to date too, or every request keeps reflecting
+            # whatever it saw at didOpen/last didChange, not what's on disk.
+            if externally_modified and self._is_open_in_ls:
+                self._notify_ls_of_external_change()
 
         return self._contents
+
+    def _notify_ls_of_external_change(self) -> None:
+        self.version += 1
+        self.language_server.server.notify.did_change_text_document(
+            {  # ty: ignore[invalid-argument-type]  # dict built from LSPConstants keys; shape matches the TypedDict
+                LSPConstants.TEXT_DOCUMENT: {
+                    LSPConstants.VERSION: self.version,
+                    LSPConstants.URI: self.uri,
+                },
+                LSPConstants.CONTENT_CHANGES: [{"text": self._contents}],
+            }
+        )
 
     @contents.setter
     def contents(self, new_contents: str) -> None:
