@@ -1,4 +1,4 @@
-"""Unit tests for GodotLanguageServer's raw document-symbol range correction.
+"""Unit tests for GodotLanguageServer's document-symbol range correction.
 
 See oraios/serena#1974: Godot's GDScript parser can report a symbol's end column one
 column past the line-end convention every other language server follows, which silently
@@ -8,7 +8,10 @@ separating blank line) when the position is later turned into a text index.
 
 from __future__ import annotations
 
-from solidlsp.language_servers.godot_language_server import _fix_range_end, _fix_symbol_ranges
+from solidlsp.language_servers.godot_language_server import GodotLanguageServer
+
+_fix_range_end = GodotLanguageServer._fix_range_end
+_fix_symbol_ranges = GodotLanguageServer._fix_symbol_ranges
 
 
 def _range(end_line: int, end_char: int, start_line: int = 0, start_char: int = 0) -> dict:

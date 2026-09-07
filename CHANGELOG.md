@@ -38,7 +38,7 @@ Status of the `main` branch. Changes prior to the next official version change w
     the next lookahead token instead of the last consumed one, when that lookahead is a
     synthesized newline); `replace_symbol_body` on the last function in a file silently
     consumed the separating blank line as a result. `GodotLanguageServer` now corrects this
-    specific, measured overshoot in its own raw document-symbol post-processing (#1974)
+    specific, measured overshoot when building its high-level document symbols (#1974)
   - Add FreeBSD mapping to platform detection
   - Remove unnecessary platform checks from the following language servers, expanding the set of
     supported platforms accordingly: Elixir Tools, Intelephense, Perl, TypeScript, VTS
