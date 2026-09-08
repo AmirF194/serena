@@ -6,6 +6,9 @@ Status of the `main` branch. Changes prior to the next official version change w
   - Fix: MCP `initialize` now reports Serena's version instead of the installed mcp SDK version (#1889)
   - Fix: Parallel agents auto-registering projects could overwrite each other's changes to the global
     project list in `serena_config.yml`
+  - Fix: `TextUtils.insert_text_at_position` returned a wrong position when the inserted text merged
+    with an adjacent character into a single newline sequence (e.g. a `\n` inserted directly after an
+    existing `\r`); the position is now determined from the resulting text
   - Fix: process-tree cleanup signaled descendant language-server processes without waiting for them,
     which could leave grandchildren as zombies; cleanup now waits for the discovered descendants (#1464)
   - Fix: `read_only` restriction in project definition was not applied to base tool set when in single-project context (#1938)
@@ -33,7 +36,14 @@ Status of the `main` branch. Changes prior to the next official version change w
   - Fix: a C# file created after the project was already indexed was analyzed by Roslyn as a
     standalone Miscellaneous Files document instead of being folded into the loaded project,
     causing phantom diagnostics on the new file and on files referencing its symbols (#1961)
+  - Fix: TypeScript and VTS now disable automatic type acquisition as intended, while VTS
+    preserves explicit user settings across initialization and configuration requests (#1989)
+    VTS initialization options now override defaults per top-level key rather than replacing the
+    entire configuration; a user-provided `typescript` block replaces the ATA default too.
+    `initializationOptions` takes precedence over the legacy `initialization_options` alias.
   - Add FreeBSD mapping to platform detection
+  - Remove unnecessary platform checks from the following language servers, expanding the set of
+    supported platforms accordingly: Elixir Tools, Intelephense, Perl, TypeScript, VTS
   - Fix: the managed Solidity language server could report no diagnostics on macOS when Hardhat could not write
     its global state under ``~/Library``; Serena now gives the child process an isolated home-directory view
     via ``solidity_state_dir`` without changing the parent process's ``HOME`` (#1817)
@@ -65,6 +75,16 @@ Status of the `main` branch. Changes prior to the next official version change w
     silently returned an empty result instead of surfacing the crash. The crash is now detected
     independently via the `window/logMessage` notification tsserver already sends, and the
     affected wait now raises instead of reporting success (#1814)
+  - Fix: two Serena instances activating the same project concurrently launched their Kotlin LSP
+    processes against the same on-disk index storage location, so the second instance's requests
+    were repeatedly cancelled by the first instance's server. A Kotlin LSP process now claims that
+    storage directory via a lock; a single instance (including across restarts) still gets the
+    same directory, and a second concurrent instance gets a directory of its own instead of
+    contending for the first one's (#1966)
+  - Fix: document symbol caching did not account for language-server-specific post-processing of
+    symbols, which was applied outside the caches; the processing of language servers that post-process
+    symbols (e.g. Go, Nix, Fortran, F#, Vue) was therefore repeated on every request or, if it mutated
+    symbols in place, re-applied to already processed cached results
 
 CLI:
   - Fix `project index-file` command not using only the relevant language server to index the given file (#1965)
